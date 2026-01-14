@@ -1,19 +1,18 @@
 import hashlib
+import math
 import os
 import urllib
 import warnings
-from typing import Union, List
+from typing import List, Union
 
-import jax
 import haiku as hk
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-import math
-
-from PIL import Image
 from haiku._src.data_structures import FlatMapping
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
 from tqdm import tqdm
 
 from .model import CLIP, get_params
@@ -41,13 +40,23 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
         raise RuntimeError(f"{download_target} exists and is not a regular file")
 
     if os.path.isfile(download_target):
-        if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
+        if (
+            hashlib.sha256(open(download_target, "rb").read()).hexdigest()
+            == expected_sha256
+        ):
             return download_target
         else:
-            warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
+            warnings.warn(
+                f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file"
+            )
 
     with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
-        with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True) as loop:
+        with tqdm(
+            total=int(source.info().get("Content-Length")),
+            ncols=80,
+            unit="iB",
+            unit_scale=True,
+        ) as loop:
             while True:
                 buffer = source.read(8192)
                 if not buffer:
@@ -56,112 +65,138 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/clip")):
                 output.write(buffer)
                 loop.update(len(buffer))
 
-    if hashlib.sha256(open(download_target, "rb").read()).hexdigest() != expected_sha256:
-        raise RuntimeError(f"Model has been downloaded but the SHA256 checksum does not not match")
+    if (
+        hashlib.sha256(open(download_target, "rb").read()).hexdigest()
+        != expected_sha256
+    ):
+        raise RuntimeError(
+            f"Model has been downloaded but the SHA256 checksum does not not match"
+        )
 
     return download_target
 
 
 def _transform(n_px):
-    return Compose([
-        Resize(n_px, interpolation=Image.BICUBIC),
-        CenterCrop(n_px),
-        lambda image: image.convert("RGB"),
-        ToTensor(),
-        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        lambda tensor: tensor.cpu().detach().numpy()
-    ])
+    return Compose(
+        [
+            Resize(n_px, interpolation=Image.BICUBIC),
+            CenterCrop(n_px),
+            lambda image: image.convert("RGB"),
+            ToTensor(),
+            Normalize(
+                (0.48145466, 0.4578275, 0.40821073),
+                (0.26862954, 0.26130258, 0.27577711),
+            ),
+            lambda tensor: tensor.cpu().detach().numpy(),
+        ]
+    )
 
 
 def available_models() -> List[str]:
     """Returns the names of available CLIP models"""
     return list(_MODELS.keys())
 
+
 def load_weights_rn50(state_dict, pytree):
 
     atom_map = {}
-    atom_map['w'] = 'weight'
-    atom_map['b'] = 'bias'
-    atom_map['scale'] = 'weight'
-    atom_map['offset'] = 'bias'
-    atom_map['query'] = 'q_proj'
-    atom_map['key'] = 'k_proj'
-    atom_map['value'] = 'v_proj'
-    atom_map['linear'] = 'c_proj'
+    atom_map["w"] = "weight"
+    atom_map["b"] = "bias"
+    atom_map["scale"] = "weight"
+    atom_map["offset"] = "bias"
+    atom_map["query"] = "q_proj"
+    atom_map["key"] = "k_proj"
+    atom_map["value"] = "v_proj"
+    atom_map["linear"] = "c_proj"
 
     for key in pytree.keys():
-        if 'visual' in key:
+        if "visual" in key:
             # stem weights
-            if 'make_layer' not in key and 'attnpool' not in key:
-                layer_name = key.split('/')[-1]
-                state_dict_key_base = 'visual.' + layer_name 
+            if "make_layer" not in key and "attnpool" not in key:
+                layer_name = key.split("/")[-1]
+                state_dict_key_base = "visual." + layer_name
                 for sub_layer, value in pytree[key].items():
-                    ind = state_dict_key_base + '.' + atom_map[sub_layer]
+                    ind = state_dict_key_base + "." + atom_map[sub_layer]
                     if len(state_dict[ind].shape) == 4:
-                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).transpose([2, 3, 1, 0])
+                        new_val = jnp.array(
+                            state_dict[ind], dtype=jnp.float32
+                        ).transpose([2, 3, 1, 0])
                     else:
                         new_val = jnp.array(state_dict[ind], dtype=jnp.float32)
                         new_val = new_val.reshape(value.shape)
                     pytree[key][sub_layer] = new_val
-            # bottleneck weights            
-            if '_make_layer' in key and 'downsample' not in key:
-                layer_name = key.split('/')[-1]
-                bottleneck_names = key.split('/')[-3]
+            # bottleneck weights
+            if "_make_layer" in key and "downsample" not in key:
+                layer_name = key.split("/")[-1]
+                bottleneck_names = key.split("/")[-3]
                 b_name_1 = int(bottleneck_names[-3])
                 b_name_2 = int(bottleneck_names[-1])
 
-                state_dict_key_base = f'visual.layer{b_name_1}.{b_name_2}.{layer_name}'
+                state_dict_key_base = f"visual.layer{b_name_1}.{b_name_2}.{layer_name}"
 
                 for sub_layer, value in pytree[key].items():
-                    ind = state_dict_key_base + '.' + atom_map[sub_layer]
+                    ind = state_dict_key_base + "." + atom_map[sub_layer]
                     if len(state_dict[ind].shape) == 4:
-                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).transpose([2, 3, 1, 0])      
+                        new_val = jnp.array(
+                            state_dict[ind], dtype=jnp.float32
+                        ).transpose([2, 3, 1, 0])
                     else:
-                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).reshape(value.shape)
+                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).reshape(
+                            value.shape
+                        )
                     pytree[key][sub_layer] = new_val
             # downsample bottleneck weights
-            if 'downsample' in key:
-                layer_name = key.split('/')[-1]
-                bottleneck_names = key.split('/')[-3]
+            if "downsample" in key:
+                layer_name = key.split("/")[-1]
+                bottleneck_names = key.split("/")[-3]
                 b_name_1 = int(bottleneck_names[-3])
                 b_name_2 = int(bottleneck_names[-1])
-                state_dict_key_base = f'visual.layer{b_name_1}.{b_name_2}.downsample.'
-                if 'downsample_conv' in key:
-                    state_dict_key_base  += '0.'
-                elif 'downsample_bn' in key:
-                    state_dict_key_base  += '1.'
+                state_dict_key_base = f"visual.layer{b_name_1}.{b_name_2}.downsample."
+                if "downsample_conv" in key:
+                    state_dict_key_base += "0."
+                elif "downsample_bn" in key:
+                    state_dict_key_base += "1."
                 for sub_layer, value in pytree[key].items():
-                    ind = state_dict_key_base + atom_map[sub_layer] 
+                    ind = state_dict_key_base + atom_map[sub_layer]
                     if len(state_dict[ind].shape) == 4:
-                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).transpose([2, 3, 1, 0])
+                        new_val = jnp.array(
+                            state_dict[ind], dtype=jnp.float32
+                        ).transpose([2, 3, 1, 0])
                     else:
-                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).reshape(value.shape)
+                        new_val = jnp.array(state_dict[ind], dtype=jnp.float32).reshape(
+                            value.shape
+                        )
                     pytree[key][sub_layer] = new_val
 
             # attnpool weights
-            if 'attnpool' in key:
-                if 'pos_e' in key:
-                    ind = 'visual.attnpool.positional_embedding'
+            if "attnpool" in key:
+                if "pos_e" in key:
+                    ind = "visual.attnpool.positional_embedding"
                     new_val = jnp.array(state_dict[ind], dtype=jnp.float32)
-                    pytree[key]['pos_embd'] = new_val
+                    pytree[key]["pos_embd"] = new_val
                 else:
-                    attn_layer_name = key.split('/')[-1]
-                    state_dict_key_base = f'visual.attnpool.{atom_map[attn_layer_name]}.'
+                    attn_layer_name = key.split("/")[-1]
+                    state_dict_key_base = (
+                        f"visual.attnpool.{atom_map[attn_layer_name]}."
+                    )
                     for sub_layer, value in pytree[key].items():
-                        ind = state_dict_key_base + atom_map[sub_layer] 
+                        ind = state_dict_key_base + atom_map[sub_layer]
                         if len(state_dict[ind].shape) == 4:
                             new_val = jnp.array(state_dict[ind], dtype=jnp.float32)
-                
+
                         else:
-                            new_val = jnp.array(state_dict[ind], dtype=jnp.float32).reshape(value.shape)
+                            new_val = jnp.array(
+                                state_dict[ind], dtype=jnp.float32
+                            ).reshape(value.shape)
                         pytree[key][sub_layer] = new_val
-        
+
+
 def convert_params(torch_state, jax_params, rn=False):
     def name_iter(pytree, root, f):
         new_out = {}
         for k, v in pytree.items():
             if rn:
-                if 'visual' not in k:
+                if "visual" not in k:
                     if isinstance(v, dict):
                         new_out[k] = name_iter(v, root + "/" + k, f)
                     else:
@@ -184,9 +219,13 @@ def convert_params(torch_state, jax_params, rn=False):
             "embeddings": "weight",
         }.get(tensor_name, tensor_name)
 
-        tensor_path = "/".join(name.split("/")[:-1]).replace("/~/", ".").replace("/", ".").replace("resblocks",
-                                                                                                   "resblocks.").replace(
-            "~", "")
+        tensor_path = (
+            "/".join(name.split("/")[:-1])
+            .replace("/~/", ".")
+            .replace("/", ".")
+            .replace("resblocks", "resblocks.")
+            .replace("~", "")
+        )
         new_tensor = value
 
         pytorch_name = tensor_path + "." + tensor_name if tensor_path else tensor_name
@@ -242,14 +281,21 @@ def load(name: str, device: Union[str, torch.device] = "cpu", jit=True):
     elif os.path.isfile(name):
         model_path = name
     else:
-        raise RuntimeError(f"Model {name} not found; available models = {available_models()}")    
+        raise RuntimeError(
+            f"Model {name} not found; available models = {available_models()}"
+        )
     try:
         # loading JIT archive
-        state_dict = torch.jit.load(model_path, map_location=device if jit else "cpu").eval().state_dict()
+        state_dict = (
+            torch.jit.load(model_path, map_location=device if jit else "cpu")
+            .eval()
+            .state_dict()
+        )
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
 
     clip_params = get_params(state_dict)
+    print(clip_params["image_resolution"])
 
     # jax model
     def clip_jax(image, text):
@@ -266,24 +312,42 @@ def load(name: str, device: Union[str, torch.device] = "cpu", jit=True):
 
     rng_key = jax.random.PRNGKey(42)
     transformed = hk.transform_with_state(clip_jax)
-    jax_params, state = transformed.init(rng=rng_key, image=jnp.zeros((1, 3, 224, 224)), text=jnp.zeros((1, 77), dtype=jnp.int16))
+    jax_params, state = transformed.init(
+        rng=rng_key,
+        image=jnp.zeros((1, 3, 224, 224)),
+        text=jnp.zeros((1, 77), dtype=jnp.int32),
+    )
     # load transformer weights
     new_jax_params = convert_params(state_dict, jax_params, rn=rn)
     for key in new_jax_params.keys():
         jax_params[key] = new_jax_params[key]
-        
+
     # load rn50 weights (todo integrate into convert_params)
     if rn:
         load_weights_rn50(state_dict, jax_params)
         image_fn = hk.without_apply_rng(hk.transform_with_state(vit_jax)).apply
         text_fn = hk.without_apply_rng(hk.transform_with_state(text_jax)).apply
-        return image_fn, text_fn, jax_params, _transform(clip_params["image_resolution"]), state
+        return (
+            image_fn,
+            text_fn,
+            jax_params,
+            _transform(clip_params["image_resolution"]),
+            state,
+        )
     else:
         image_fn = hk.without_apply_rng(hk.transform(vit_jax)).apply
         text_fn = hk.without_apply_rng(hk.transform(text_jax)).apply
-        return image_fn, text_fn, jax_params, _transform(clip_params["image_resolution"])
+        return (
+            image_fn,
+            text_fn,
+            jax_params,
+            _transform(clip_params["image_resolution"]),
+        )
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.LongTensor:
+
+def tokenize(
+    texts: Union[str, List[str]], context_length: int = 77
+) -> torch.LongTensor:
     """
     Returns the tokenized representation of given input string(s)
 
@@ -309,7 +373,9 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.Lo
 
     for i, tokens in enumerate(all_tokens):
         if len(tokens) > context_length:
-            raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
-        result[i, :len(tokens)] = tokens
+            raise RuntimeError(
+                f"Input {texts[i]} is too long for context length {context_length}"
+            )
+        result[i, : len(tokens)] = tokens
 
     return result
